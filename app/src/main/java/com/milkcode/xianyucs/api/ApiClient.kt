@@ -13,11 +13,6 @@ import java.util.concurrent.TimeUnit
 /**
  * 闲鱼管理系统 API 客户端
  * 对接上游 FastAPI 后端 (xianyu-auto-reply-fix)
- *
- * 设计要点：
- *  - baseUrl 由用户在设置页填写（如 http://1.2.3.4:9000）
- *  - 登录后 token 存内存 + 可持久化
- *  - 接口路径做多候选探测，兼容不同版本
  */
 class ApiClient(var baseUrl: String = "") {
 
@@ -50,23 +45,30 @@ class ApiClient(var baseUrl: String = "") {
     private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
     /** 执行请求，返回 body；非 2xx 抛异常 */
-    private suspend fun exec(call: Call): String = withContext(Dispatchers.IO) {
-        call.execute().use { resp ->
+    private suspend fun exec(req: Request): String = withContext(Dispatchers.IO) {
+        http.newCall(req).execute().use { resp ->
             val body = resp.body?.string() ?: ""
             if (!resp.isSuccessful) throw ApiException(resp.code, "HTTP ${resp.code}: ${body.take(200)}")
             body
         }
     }
 
+    private suspend fun get(path: String): String = exec(reqBuilder(path).get().build())
+
+    private suspend fun post(path: String, bodyJson: String = "{}"): String =
+        exec(reqBuilder(path).post(bodyJson.toRequestBody(JSON_MEDIA)).build())
+
+    private suspend fun delete(path: String): String =
+        exec(reqBuilder(path).delete().build())
+
     // ---------- 登录 ----------
-    /** 尝试多个登录路径，返回可用路径 */
     suspend fun login(username: String, password: String): LoginResponse {
         val paths = listOf("/api/auth/login", "/api/login", "/auth/login", "/login")
         var lastErr: Exception? = null
         for (p in paths) {
             try {
                 val body = json.encodeToString(LoginRequest.serializer(), LoginRequest(username, password))
-                val r = exec(reqBuilder(p).post(body.toRequestBody(JSON_MEDIA)).build())
+                val r = post(p, body)
                 val parsed = json.decodeFromString(LoginResponse.serializer(), r)
                 if (parsed.bearer.isNotBlank()) {
                     token = parsed.bearer
@@ -83,9 +85,7 @@ class ApiClient(var baseUrl: String = "") {
         var lastErr: Exception? = null
         for (p in paths) {
             try {
-                val r = exec(reqBuilder(p).get().build())
-                // 可能是数组，也可能是包装对象
-                return parseAccounts(r)
+                return parseAccounts(get(p))
             } catch (e: Exception) { lastErr = e }
         }
         throw lastErr ?: ApiException(0, "获取账号失败")
@@ -109,18 +109,13 @@ class ApiClient(var baseUrl: String = "") {
             "/api/accounts/$id/toggle"
         )
         for (p in paths) {
-            try {
-                exec(reqBuilder(p).post("{}".toRequestBody(JSON_MEDIA)).build())
-                return true
-            } catch (_: Exception) { }
+            try { post(p); return true } catch (_: Exception) { }
         }
         return false
     }
 
     suspend fun deleteAccount(id: Any): Boolean {
-        return try {
-            exec(reqBuilder("/api/accounts/$id").delete().build()); true
-        } catch (_: Exception) { false }
+        return try { delete("/api/accounts/$id"); true } catch (_: Exception) { false }
     }
 
     // ---------- 关键词规则 ----------
@@ -128,8 +123,7 @@ class ApiClient(var baseUrl: String = "") {
         val paths = listOf("/api/keywords", "/api/keyword/list", "/api/reply/keywords")
         for (p in paths) {
             try {
-                val r = exec(reqBuilder(p).get().build())
-                val t = r.trim()
+                val t = get(p).trim()
                 return if (t.startsWith("[")) json.decodeFromString(
                     kotlinx.serialization.builtins.ListSerializer(KeywordRule.serializer()), t)
                 else emptyList()
@@ -141,14 +135,13 @@ class ApiClient(var baseUrl: String = "") {
     suspend fun addKeyword(rule: KeywordRule): Boolean {
         return try {
             val body = json.encodeToString(KeywordRule.serializer(), rule)
-            exec(reqBuilder("/api/keywords").post(body.toRequestBody(JSON_MEDIA)).build())
+            post("/api/keywords", body)
             true
         } catch (_: Exception) { false }
     }
 
     suspend fun deleteKeyword(id: Any): Boolean {
-        return try { exec(reqBuilder("/api/keywords/$id").delete().build()); true }
-        catch (_: Exception) { false }
+        return try { delete("/api/keywords/$id"); true } catch (_: Exception) { false }
     }
 
     // ---------- 日志 ----------
@@ -156,8 +149,7 @@ class ApiClient(var baseUrl: String = "") {
         val paths = listOf("/api/logs?limit=$limit", "/api/log/recent?limit=$limit", "/api/logs")
         for (p in paths) {
             try {
-                val r = exec(reqBuilder(p).get().build())
-                val t = r.trim()
+                val t = get(p).trim()
                 return if (t.startsWith("[")) json.decodeFromString(
                     kotlinx.serialization.builtins.ListSerializer(LogEntry.serializer()), t)
                 else emptyList()
@@ -171,8 +163,7 @@ class ApiClient(var baseUrl: String = "") {
         val paths = listOf("/api/stats", "/api/system/stats", "/api/statistics")
         for (p in paths) {
             try {
-                val r = exec(reqBuilder(p).get().build())
-                return json.decodeFromString(SystemStat.serializer(), r)
+                return json.decodeFromString(SystemStat.serializer(), get(p))
             } catch (_: Exception) { }
         }
         return null
@@ -182,8 +173,7 @@ class ApiClient(var baseUrl: String = "") {
     suspend fun healthCheck(): Boolean = withContext(Dispatchers.IO) {
         try {
             val b = baseUrl.trimEnd('/')
-            val r = http.newCall(Request.Builder().url("$b/health").get().build()).execute()
-            r.use { it.isSuccessful }
+            http.newCall(Request.Builder().url("$b/health").get().build()).execute().use { it.isSuccessful }
         } catch (_: Exception) { false }
     }
 }
